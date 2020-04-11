@@ -9,23 +9,21 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"reflect"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/micro/go-log"
-	"github.com/micro/go-micro/codec"
+	"github.com/micro/go-micro/v2/codec"
+	merrors "github.com/micro/go-micro/v2/errors"
 )
 
 var (
 	lastStreamResponseError = errors.New("EOS")
-	// A value sent as a placeholder for the server's response value when the server
-	// receives an invalid request. It is never decoded by the client since the Response
-	// contains an error when it is used.
-	invalidRequest = struct{}{}
 
 	// Precompute the reflect type for error. Can't use error directly
 	// because Typeof takes an empty interface value. This is annoying.
@@ -60,19 +58,44 @@ type response struct {
 
 // router represents an RPC router.
 type router struct {
-	name         string
-	mu           sync.Mutex // protects the serviceMap
-	serviceMap   map[string]*service
-	reqLock      sync.Mutex // protects freeReq
-	freeReq      *request
-	respLock     sync.Mutex // protects freeResp
-	freeResp     *response
+	name string
+
+	mu         sync.Mutex // protects the serviceMap
+	serviceMap map[string]*service
+
+	reqLock sync.Mutex // protects freeReq
+	freeReq *request
+
+	respLock sync.Mutex // protects freeResp
+	freeResp *response
+
+	// handler wrappers
 	hdlrWrappers []HandlerWrapper
+	// subscriber wrappers
+	subWrappers []SubscriberWrapper
+
+	su          sync.RWMutex
+	subscribers map[string][]*subscriber
+}
+
+// rpcRouter encapsulates functions that become a server.Router
+type rpcRouter struct {
+	h func(context.Context, Request, interface{}) error
+	m func(context.Context, Message) error
+}
+
+func (r rpcRouter) ProcessMessage(ctx context.Context, msg Message) error {
+	return r.m(ctx, msg)
+}
+
+func (r rpcRouter) ServeRequest(ctx context.Context, req Request, rsp Response) error {
+	return r.h(ctx, req, rsp)
 }
 
 func newRpcRouter() *router {
 	return &router{
-		serviceMap: make(map[string]*service),
+		serviceMap:  make(map[string]*service),
+		subscribers: make(map[string][]*subscriber),
 	}
 }
 
@@ -117,7 +140,7 @@ func prepareMethod(method reflect.Method) *methodType {
 		replyType = mtype.In(3)
 		contextType = mtype.In(1)
 	default:
-		log.Log("method", mname, "of", mtype, "has wrong number of ins:", mtype.NumIn())
+		log.Error("method", mname, "of", mtype, "has wrong number of ins:", mtype.NumIn())
 		return nil
 	}
 
@@ -125,7 +148,7 @@ func prepareMethod(method reflect.Method) *methodType {
 		// check stream type
 		streamType := reflect.TypeOf((*Stream)(nil)).Elem()
 		if !argType.Implements(streamType) {
-			log.Log(mname, "argument does not implement Stream interface:", argType)
+			log.Error(mname, "argument does not implement Stream interface:", argType)
 			return nil
 		}
 	} else {
@@ -133,30 +156,30 @@ func prepareMethod(method reflect.Method) *methodType {
 
 		// First arg need not be a pointer.
 		if !isExportedOrBuiltinType(argType) {
-			log.Log(mname, "argument type not exported:", argType)
+			log.Error(mname, "argument type not exported:", argType)
 			return nil
 		}
 
 		if replyType.Kind() != reflect.Ptr {
-			log.Log("method", mname, "reply type not a pointer:", replyType)
+			log.Error("method", mname, "reply type not a pointer:", replyType)
 			return nil
 		}
 
 		// Reply type must be exported.
 		if !isExportedOrBuiltinType(replyType) {
-			log.Log("method", mname, "reply type not exported:", replyType)
+			log.Error("method", mname, "reply type not exported:", replyType)
 			return nil
 		}
 	}
 
 	// Method needs one out.
 	if mtype.NumOut() != 1 {
-		log.Log("method", mname, "has wrong number of outs:", mtype.NumOut())
+		log.Error("method", mname, "has wrong number of outs:", mtype.NumOut())
 		return nil
 	}
 	// The return type of the method must be error.
 	if returnType := mtype.Out(0); returnType != typeOfError {
-		log.Log("method", mname, "returns", returnType.String(), "not error")
+		log.Error("method", mname, "returns", returnType.String(), "not error")
 		return nil
 	}
 	return &methodType{method: method, ArgType: argType, ReplyType: replyType, ContextType: contextType, stream: stream}
@@ -188,6 +211,12 @@ func (s *service) call(ctx context.Context, router *router, sending *sync.Mutex,
 		method:      req.msg.Method,
 		endpoint:    req.msg.Endpoint,
 		body:        req.msg.Body,
+		header:      req.msg.Header,
+	}
+
+	// only set if not nil
+	if argv.IsValid() {
+		r.rawBody = argv.Interface()
 	}
 
 	if !mtype.stream {
@@ -202,6 +231,11 @@ func (s *service) call(ctx context.Context, router *router, sending *sync.Mutex,
 			return nil
 		}
 
+		// wrap the handler
+		for i := len(router.hdlrWrappers); i > 0; i-- {
+			fn = router.hdlrWrappers[i-1](fn)
+		}
+
 		// execute handler
 		if err := fn(ctx, r, replyv.Interface()); err != nil {
 			return err
@@ -214,9 +248,7 @@ func (s *service) call(ctx context.Context, router *router, sending *sync.Mutex,
 	// declare a local error to see if we errored out already
 	// keep track of the type, to make sure we return
 	// the same one consistently
-	var lastError error
-
-	stream := &rpcStream{
+	rawStream := &rpcStream{
 		context: ctx,
 		codec:   cc.(codec.Codec),
 		request: r,
@@ -229,27 +261,24 @@ func (s *service) call(ctx context.Context, router *router, sending *sync.Mutex,
 		if err := returnValues[0].Interface(); err != nil {
 			// the function returned an error, we use that
 			return err.(error)
-		} else if lastError != nil {
-			// we had an error inside sendReply, we use that
-			return lastError
+		} else if serr := rawStream.Error(); serr == io.EOF || serr == io.ErrUnexpectedEOF {
+			return nil
 		} else {
 			// no error, we send the special EOS error
 			return lastStreamResponseError
 		}
 	}
 
+	// wrap the handler
+	for i := len(router.hdlrWrappers); i > 0; i-- {
+		fn = router.hdlrWrappers[i-1](fn)
+	}
+
 	// client.Stream request
 	r.stream = true
 
 	// execute handler
-	if err := fn(ctx, r, stream); err != nil {
-		return err
-	}
-
-	// this is the last packet, we don't do anything with
-	// the error here (well sendStreamResponse will log it
-	// already)
-	return router.sendResponse(sending, req, nil, cc, true)
+	return fn(ctx, r, rawStream)
 }
 
 func (m *methodType) prepareContext(ctx context.Context) reflect.Value {
@@ -313,7 +342,9 @@ func (router *router) readRequest(r Request) (service *service, mtype *methodTyp
 	}
 	// is it a streaming request? then we don't read the body
 	if mtype.stream {
-		cc.ReadBody(nil)
+		if cc.(codec.Codec).String() != "grpc" {
+			cc.ReadBody(nil)
+		}
 		return
 	}
 
@@ -443,4 +474,139 @@ func (router *router) ServeRequest(ctx context.Context, r Request, rsp Response)
 		return err
 	}
 	return service.call(ctx, router, sending, mtype, req, argv, replyv, rsp.Codec())
+}
+
+func (router *router) NewSubscriber(topic string, handler interface{}, opts ...SubscriberOption) Subscriber {
+	return newSubscriber(topic, handler, opts...)
+}
+
+func (router *router) Subscribe(s Subscriber) error {
+	sub, ok := s.(*subscriber)
+	if !ok {
+		return fmt.Errorf("invalid subscriber: expected *subscriber")
+	}
+	if len(sub.handlers) == 0 {
+		return fmt.Errorf("invalid subscriber: no handler functions")
+	}
+
+	if err := validateSubscriber(sub); err != nil {
+		return err
+	}
+
+	router.su.Lock()
+	defer router.su.Unlock()
+
+	// append to subscribers
+	subs := router.subscribers[sub.Topic()]
+	subs = append(subs, sub)
+	router.subscribers[sub.Topic()] = subs
+
+	return nil
+}
+
+func (router *router) ProcessMessage(ctx context.Context, msg Message) (err error) {
+	defer func() {
+		// recover any panics
+		if r := recover(); r != nil {
+			log.Error("panic recovered: ", r)
+			log.Error(string(debug.Stack()))
+			err = merrors.InternalServerError("go.micro.server", "panic recovered: %v", r)
+		}
+	}()
+
+	router.su.RLock()
+	// get the subscribers by topic
+	subs, ok := router.subscribers[msg.Topic()]
+	// unlock since we only need to get the subs
+	router.su.RUnlock()
+	if !ok {
+		return nil
+	}
+
+	var errResults []string
+
+	// we may have multiple subscribers for the topic
+	for _, sub := range subs {
+		// we may have multiple handlers per subscriber
+		for i := 0; i < len(sub.handlers); i++ {
+			// get the handler
+			handler := sub.handlers[i]
+
+			var isVal bool
+			var req reflect.Value
+
+			// check whether the handler is a pointer
+			if handler.reqType.Kind() == reflect.Ptr {
+				req = reflect.New(handler.reqType.Elem())
+			} else {
+				req = reflect.New(handler.reqType)
+				isVal = true
+			}
+
+			// if its a value get the element
+			if isVal {
+				req = req.Elem()
+			}
+
+			cc := msg.Codec()
+
+			// read the header. mostly a noop
+			if err = cc.ReadHeader(&codec.Message{}, codec.Event); err != nil {
+				return err
+			}
+
+			// read the body into the handler request value
+			if err = cc.ReadBody(req.Interface()); err != nil {
+				return err
+			}
+
+			// create the handler which will honour the SubscriberFunc type
+			fn := func(ctx context.Context, msg Message) error {
+				var vals []reflect.Value
+				if sub.typ.Kind() != reflect.Func {
+					vals = append(vals, sub.rcvr)
+				}
+				if handler.ctxType != nil {
+					vals = append(vals, reflect.ValueOf(ctx))
+				}
+
+				// values to pass the handler
+				vals = append(vals, reflect.ValueOf(msg.Payload()))
+
+				// execute the actuall call of the handler
+				returnValues := handler.method.Call(vals)
+				if rerr := returnValues[0].Interface(); rerr != nil {
+					err = rerr.(error)
+				}
+				return err
+			}
+
+			// wrap with subscriber wrappers
+			for i := len(router.subWrappers); i > 0; i-- {
+				fn = router.subWrappers[i-1](fn)
+			}
+
+			// create new rpc message
+			rpcMsg := &rpcMessage{
+				topic:       msg.Topic(),
+				contentType: msg.ContentType(),
+				payload:     req.Interface(),
+				codec:       msg.(*rpcMessage).codec,
+				header:      msg.Header(),
+				body:        msg.Body(),
+			}
+
+			// execute the message handler
+			if err = fn(ctx, rpcMsg); err != nil {
+				errResults = append(errResults, err.Error())
+			}
+		}
+	}
+
+	// if no errors just return
+	if len(errResults) > 0 {
+		err = merrors.InternalServerError("go.micro.server", "subscriber error: %v", strings.Join(errResults, "\n"))
+	}
+
+	return err
 }

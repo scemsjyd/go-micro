@@ -5,24 +5,21 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/micro/go-micro/errors"
-	"github.com/micro/go-micro/registry"
-	"github.com/micro/go-micro/registry/memory"
-	"github.com/micro/go-micro/selector"
+	"github.com/micro/go-micro/v2/client/selector"
+	"github.com/micro/go-micro/v2/errors"
+	"github.com/micro/go-micro/v2/registry"
+	"github.com/micro/go-micro/v2/registry/memory"
 )
 
 func newTestRegistry() registry.Registry {
-	r := memory.NewRegistry()
-	r.(*memory.Registry).Setup()
-	return r
+	return memory.NewRegistry(memory.Services(testData))
 }
 
 func TestCallAddress(t *testing.T) {
 	var called bool
 	service := "test.service"
 	endpoint := "Test.Endpoint"
-	address := "10.1.10.1"
-	port := 8080
+	address := "10.1.10.1:8080"
 
 	wrap := func(cf CallFunc) CallFunc {
 		return func(ctx context.Context, node *registry.Node, req Request, rsp interface{}, opts CallOptions) error {
@@ -40,10 +37,6 @@ func TestCallAddress(t *testing.T) {
 				return fmt.Errorf("expected address: %s got %s", address, node.Address)
 			}
 
-			if node.Port != port {
-				return fmt.Errorf("expected address: %d got %d", port, node.Port)
-			}
-
 			// don't do the call
 			return nil
 		}
@@ -59,7 +52,7 @@ func TestCallAddress(t *testing.T) {
 	req := c.NewRequest(service, endpoint, nil)
 
 	// test calling remote address
-	if err := c.Call(context.Background(), req, nil, WithAddress(fmt.Sprintf("%s:%d", address, port))); err != nil {
+	if err := c.Call(context.Background(), req, nil, WithAddress(address)); err != nil {
 		t.Fatal("call with address error", err)
 	}
 
@@ -113,8 +106,7 @@ func TestCallWrapper(t *testing.T) {
 	id := "test.1"
 	service := "test.service"
 	endpoint := "Test.Endpoint"
-	address := "10.1.10.1"
-	port := 8080
+	address := "10.1.10.1:8080"
 
 	wrap := func(cf CallFunc) CallFunc {
 		return func(ctx context.Context, node *registry.Node, req Request, rsp interface{}, opts CallOptions) error {
@@ -148,10 +140,12 @@ func TestCallWrapper(t *testing.T) {
 		Name:    service,
 		Version: "latest",
 		Nodes: []*registry.Node{
-			&registry.Node{
+			{
 				Id:      id,
 				Address: address,
-				Port:    port,
+				Metadata: map[string]string{
+					"protocol": "mucp",
+				},
 			},
 		},
 	})

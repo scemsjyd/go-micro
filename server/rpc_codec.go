@@ -2,28 +2,35 @@ package server
 
 import (
 	"bytes"
+	"sync"
 
-	"github.com/micro/go-micro/codec"
-	raw "github.com/micro/go-micro/codec/bytes"
-	"github.com/micro/go-micro/codec/grpc"
-	"github.com/micro/go-micro/codec/json"
-	"github.com/micro/go-micro/codec/jsonrpc"
-	"github.com/micro/go-micro/codec/proto"
-	"github.com/micro/go-micro/codec/protorpc"
-	"github.com/micro/go-micro/transport"
+	"github.com/micro/go-micro/v2/codec"
+	raw "github.com/micro/go-micro/v2/codec/bytes"
+	"github.com/micro/go-micro/v2/codec/grpc"
+	"github.com/micro/go-micro/v2/codec/json"
+	"github.com/micro/go-micro/v2/codec/jsonrpc"
+	"github.com/micro/go-micro/v2/codec/proto"
+	"github.com/micro/go-micro/v2/codec/protorpc"
+	"github.com/micro/go-micro/v2/transport"
+	"github.com/oxtoacart/bpool"
 	"github.com/pkg/errors"
 )
 
 type rpcCodec struct {
-	socket transport.Socket
-	codec  codec.Codec
-	first  bool
+	socket   transport.Socket
+	codec    codec.Codec
+	protocol string
 
 	req *transport.Message
 	buf *readWriteCloser
+
+	// check if we're the first
+	sync.RWMutex
+	first chan bool
 }
 
 type readWriteCloser struct {
+	sync.RWMutex
 	wbuf *bytes.Buffer
 	rbuf *bytes.Buffer
 }
@@ -50,19 +57,24 @@ var (
 		"application/proto-rpc":    protorpc.NewCodec,
 		"application/octet-stream": protorpc.NewCodec,
 	}
+
+	// the local buffer pool
+	bufferPool = bpool.NewSizedBufferPool(32, 1)
 )
 
 func (rwc *readWriteCloser) Read(p []byte) (n int, err error) {
+	rwc.RLock()
+	defer rwc.RUnlock()
 	return rwc.rbuf.Read(p)
 }
 
 func (rwc *readWriteCloser) Write(p []byte) (n int, err error) {
+	rwc.Lock()
+	defer rwc.Unlock()
 	return rwc.wbuf.Write(p)
 }
 
 func (rwc *readWriteCloser) Close() error {
-	rwc.rbuf.Reset()
-	rwc.wbuf.Reset()
 	return nil
 }
 
@@ -74,24 +86,18 @@ func getHeader(hdr string, md map[string]string) string {
 }
 
 func getHeaders(m *codec.Message) {
-	get := func(hdr, v string) string {
+	set := func(v, hdr string) string {
 		if len(v) > 0 {
 			return v
 		}
-
-		if hd := m.Header[hdr]; len(hd) > 0 {
-			return hd
-		}
-
-		// old
-		return m.Header["X-"+hdr]
+		return m.Header[hdr]
 	}
 
-	m.Id = get("Micro-Id", m.Id)
-	m.Error = get("Micro-Error", m.Error)
-	m.Endpoint = get("Micro-Endpoint", m.Endpoint)
-	m.Method = get("Micro-Method", m.Method)
-	m.Target = get("Micro-Service", m.Target)
+	m.Id = set(m.Id, "Micro-Id")
+	m.Error = set(m.Error, "Micro-Error")
+	m.Endpoint = set(m.Endpoint, "Micro-Endpoint")
+	m.Method = set(m.Method, "Micro-Method")
+	m.Target = set(m.Target, "Micro-Service")
 
 	// TODO: remove this cruft
 	if len(m.Endpoint) == 0 {
@@ -123,9 +129,15 @@ func setupProtocol(msg *transport.Message) codec.NewCodec {
 	endpoint := getHeader("Micro-Endpoint", msg.Header)
 	protocol := getHeader("Micro-Protocol", msg.Header)
 	target := getHeader("Micro-Target", msg.Header)
+	topic := getHeader("Micro-Topic", msg.Header)
 
 	// if the protocol exists (mucp) do nothing
 	if len(protocol) > 0 {
+		return nil
+	}
+
+	// newer method of processing messages over transport
+	if len(topic) > 0 {
 		return nil
 	}
 
@@ -154,16 +166,32 @@ func setupProtocol(msg *transport.Message) codec.NewCodec {
 
 func newRpcCodec(req *transport.Message, socket transport.Socket, c codec.NewCodec) codec.Codec {
 	rwc := &readWriteCloser{
-		rbuf: bytes.NewBuffer(req.Body),
-		wbuf: bytes.NewBuffer(nil),
+		rbuf: bufferPool.Get(),
+		wbuf: bufferPool.Get(),
 	}
+
 	r := &rpcCodec{
-		first:  true,
-		buf:    rwc,
-		codec:  c(rwc),
-		req:    req,
-		socket: socket,
+		buf:      rwc,
+		codec:    c(rwc),
+		req:      req,
+		socket:   socket,
+		protocol: "mucp",
+		first:    make(chan bool),
 	}
+
+	// if grpc pre-load the buffer
+	// TODO: remove this terrible hack
+	switch r.codec.String() {
+	case "grpc":
+		// write the body
+		rwc.rbuf.Write(req.Body)
+		// set the protocol
+		r.protocol = "grpc"
+	default:
+		// first is not preloaded
+		close(r.first)
+	}
+
 	return r
 }
 
@@ -174,8 +202,10 @@ func (c *rpcCodec) ReadHeader(r *codec.Message, t codec.MessageType) error {
 		Body:   c.req.Body,
 	}
 
-	// if its a follow on request read it
-	if !c.first {
+	// first message could be pre-loaded
+	select {
+	case <-c.first:
+		// not the first
 		var tm transport.Message
 
 		// read off the socket
@@ -197,10 +227,25 @@ func (c *rpcCodec) ReadHeader(r *codec.Message, t codec.MessageType) error {
 
 		// set req
 		c.req = &tm
+	default:
+		// we need to lock here to prevent race conditions
+		// and we make use of a channel otherwise because
+		// this does not result in a context switch
+		// locking to check c.first on every call to ReadHeader
+		// would otherwise drastically slow the code execution
+		c.Lock()
+		// recheck before closing because the select statement
+		// above is not thread safe, so thread safety here is
+		// mandatory
+		select {
+		case <-c.first:
+		default:
+			// disable first
+			close(c.first)
+		}
+		// now unlock and we never need this again
+		c.Unlock()
 	}
-
-	// no longer first read
-	c.first = false
 
 	// set some internal things
 	getHeaders(&m)
@@ -270,7 +315,6 @@ func (c *rpcCodec) Write(r *codec.Message, b interface{}) error {
 
 		// write an error if it failed
 		m.Error = errors.Wrapf(err, "Unable to encode body").Error()
-		m.Header["X-Micro-Error"] = m.Error
 		m.Header["Micro-Error"] = m.Error
 		// no body to write
 		if err := c.codec.Write(m, nil); err != nil {
@@ -294,11 +338,17 @@ func (c *rpcCodec) Write(r *codec.Message, b interface{}) error {
 }
 
 func (c *rpcCodec) Close() error {
-	c.buf.Close()
+	// close the codec
 	c.codec.Close()
-	return c.socket.Close()
+	// close the socket
+	err := c.socket.Close()
+	// put back the buffers
+	bufferPool.Put(c.buf.rbuf)
+	bufferPool.Put(c.buf.wbuf)
+	// return the error
+	return err
 }
 
 func (c *rpcCodec) String() string {
-	return "rpc"
+	return c.protocol
 }

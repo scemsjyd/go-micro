@@ -4,16 +4,16 @@ import (
 	"bytes"
 	errs "errors"
 
-	"github.com/micro/go-micro/codec"
-	raw "github.com/micro/go-micro/codec/bytes"
-	"github.com/micro/go-micro/codec/grpc"
-	"github.com/micro/go-micro/codec/json"
-	"github.com/micro/go-micro/codec/jsonrpc"
-	"github.com/micro/go-micro/codec/proto"
-	"github.com/micro/go-micro/codec/protorpc"
-	"github.com/micro/go-micro/errors"
-	"github.com/micro/go-micro/registry"
-	"github.com/micro/go-micro/transport"
+	"github.com/micro/go-micro/v2/codec"
+	raw "github.com/micro/go-micro/v2/codec/bytes"
+	"github.com/micro/go-micro/v2/codec/grpc"
+	"github.com/micro/go-micro/v2/codec/json"
+	"github.com/micro/go-micro/v2/codec/jsonrpc"
+	"github.com/micro/go-micro/v2/codec/proto"
+	"github.com/micro/go-micro/v2/codec/protorpc"
+	"github.com/micro/go-micro/v2/errors"
+	"github.com/micro/go-micro/v2/registry"
+	"github.com/micro/go-micro/v2/transport"
 )
 
 const (
@@ -39,6 +39,9 @@ type rpcCodec struct {
 
 	req *transport.Message
 	buf *readWriteCloser
+
+	// signify if its a stream
+	stream string
 }
 
 type readWriteCloser struct {
@@ -85,47 +88,43 @@ func (rwc *readWriteCloser) Close() error {
 }
 
 func getHeaders(m *codec.Message) {
-	get := func(hdr string) string {
-		if hd := m.Header[hdr]; len(hd) > 0 {
-			return hd
+	set := func(v, hdr string) string {
+		if len(v) > 0 {
+			return v
 		}
-		// old
-		return m.Header["X-"+hdr]
+		return m.Header[hdr]
 	}
 
 	// check error in header
-	if len(m.Error) == 0 {
-		m.Error = get("Micro-Error")
-	}
+	m.Error = set(m.Error, "Micro-Error")
 
 	// check endpoint in header
-	if len(m.Endpoint) == 0 {
-		m.Endpoint = get("Micro-Endpoint")
-	}
+	m.Endpoint = set(m.Endpoint, "Micro-Endpoint")
 
 	// check method in header
-	if len(m.Method) == 0 {
-		m.Method = get("Micro-Method")
-	}
+	m.Method = set(m.Method, "Micro-Method")
 
-	if len(m.Id) == 0 {
-		m.Id = get("Micro-Id")
-	}
+	// set the request id
+	m.Id = set(m.Id, "Micro-Id")
 }
 
-func setHeaders(m *codec.Message) {
+func setHeaders(m *codec.Message, stream string) {
 	set := func(hdr, v string) {
 		if len(v) == 0 {
 			return
 		}
 		m.Header[hdr] = v
-		m.Header["X-"+hdr] = v
 	}
 
 	set("Micro-Id", m.Id)
 	set("Micro-Service", m.Target)
 	set("Micro-Method", m.Method)
 	set("Micro-Endpoint", m.Endpoint)
+	set("Micro-Error", m.Error)
+
+	if len(stream) > 0 {
+		set("Micro-Stream", stream)
+	}
 }
 
 // setupProtocol sets up the old protocol
@@ -134,6 +133,11 @@ func setupProtocol(msg *transport.Message, node *registry.Node) codec.NewCodec {
 
 	// got protocol
 	if len(protocol) > 0 {
+		return nil
+	}
+
+	// processing topic publishing
+	if len(msg.Header["Micro-Topic"]) > 0 {
 		return nil
 	}
 
@@ -149,7 +153,7 @@ func setupProtocol(msg *transport.Message, node *registry.Node) codec.NewCodec {
 	return defaultCodecs[msg.Header["Content-Type"]]
 }
 
-func newRpcCodec(req *transport.Message, client transport.Client, c codec.NewCodec) codec.Codec {
+func newRpcCodec(req *transport.Message, client transport.Client, c codec.NewCodec, stream string) codec.Codec {
 	rwc := &readWriteCloser{
 		wbuf: bytes.NewBuffer(nil),
 		rbuf: bytes.NewBuffer(nil),
@@ -159,6 +163,7 @@ func newRpcCodec(req *transport.Message, client transport.Client, c codec.NewCod
 		client: client,
 		codec:  c(rwc),
 		req:    req,
+		stream: stream,
 	}
 	return r
 }
@@ -177,25 +182,21 @@ func (c *rpcCodec) Write(m *codec.Message, body interface{}) error {
 	}
 
 	// set the mucp headers
-	setHeaders(m)
+	setHeaders(m, c.stream)
 
 	// if body is bytes Frame don't encode
 	if body != nil {
-		b, ok := body.(*raw.Frame)
-		if ok {
+		if b, ok := body.(*raw.Frame); ok {
 			// set body
 			m.Body = b.Data
-			body = nil
+		} else {
+			// write to codec
+			if err := c.codec.Write(m, body); err != nil {
+				return errors.InternalServerError("go.micro.client.codec", err.Error())
+			}
+			// set body
+			m.Body = c.buf.wbuf.Bytes()
 		}
-	}
-
-	if len(m.Body) == 0 {
-		// write to codec
-		if err := c.codec.Write(m, body); err != nil {
-			return errors.InternalServerError("go.micro.client.codec", err.Error())
-		}
-		// set body
-		m.Body = c.buf.wbuf.Bytes()
 	}
 
 	// create new transport message
@@ -203,10 +204,12 @@ func (c *rpcCodec) Write(m *codec.Message, body interface{}) error {
 		Header: m.Header,
 		Body:   m.Body,
 	}
+
 	// send the request
 	if err := c.client.Send(&msg); err != nil {
 		return errors.InternalServerError("go.micro.client.transport", err.Error())
 	}
+
 	return nil
 }
 
@@ -240,6 +243,12 @@ func (c *rpcCodec) ReadHeader(m *codec.Message, r codec.MessageType) error {
 
 func (c *rpcCodec) ReadBody(b interface{}) error {
 	// read body
+	// read raw data
+	if v, ok := b.(*raw.Frame); ok {
+		v.Data = c.buf.rbuf.Bytes()
+		return nil
+	}
+
 	if err := c.codec.ReadBody(b); err != nil {
 		return errors.InternalServerError("go.micro.client.codec", err.Error())
 	}

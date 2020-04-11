@@ -5,7 +5,7 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/micro/go-micro/registry"
+	"github.com/micro/go-micro/v2/registry"
 )
 
 func extractValue(v reflect.Type, d int) *registry.Value {
@@ -18,10 +18,6 @@ func extractValue(v reflect.Type, d int) *registry.Value {
 
 	if v.Kind() == reflect.Ptr {
 		v = v.Elem()
-	}
-
-	if len(v.Name()) == 0 {
-		return nil
 	}
 
 	arg := &registry.Value{
@@ -65,10 +61,6 @@ func extractValue(v reflect.Type, d int) *registry.Value {
 			p = p.Elem()
 		}
 		arg.Type = "[]" + p.Name()
-		val := extractValue(v.Elem(), d+1)
-		if val != nil {
-			arg.Values = append(arg.Values, val)
-		}
 	}
 
 	return arg
@@ -103,14 +95,21 @@ func extractEndpoint(method reflect.Method) *registry.Endpoint {
 	request := extractValue(reqType, 0)
 	response := extractValue(rspType, 0)
 
-	return &registry.Endpoint{
+	ep := &registry.Endpoint{
 		Name:     method.Name,
 		Request:  request,
 		Response: response,
-		Metadata: map[string]string{
-			"stream": fmt.Sprintf("%v", stream),
-		},
+		Metadata: make(map[string]string),
 	}
+
+	// set endpoint metadata for stream
+	if stream {
+		ep.Metadata = map[string]string{
+			"stream": fmt.Sprintf("%v", stream),
+		}
+	}
+
+	return ep
 }
 
 func extractSubValue(typ reflect.Type) *registry.Value {

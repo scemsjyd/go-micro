@@ -1,42 +1,47 @@
 package client
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"net"
 	"os"
-	"strconv"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/micro/go-micro/broker"
-	"github.com/micro/go-micro/codec"
-	"github.com/micro/go-micro/errors"
-	"github.com/micro/go-micro/metadata"
-	"github.com/micro/go-micro/registry"
-	"github.com/micro/go-micro/selector"
-	"github.com/micro/go-micro/transport"
+	"github.com/micro/go-micro/v2/broker"
+	"github.com/micro/go-micro/v2/client/selector"
+	"github.com/micro/go-micro/v2/codec"
+	raw "github.com/micro/go-micro/v2/codec/bytes"
+	"github.com/micro/go-micro/v2/errors"
+	"github.com/micro/go-micro/v2/metadata"
+	"github.com/micro/go-micro/v2/registry"
+	"github.com/micro/go-micro/v2/transport"
+	"github.com/micro/go-micro/v2/util/buf"
+	"github.com/micro/go-micro/v2/util/pool"
 )
 
 type rpcClient struct {
-	once sync.Once
+	once atomic.Value
 	opts Options
-	pool *pool
+	pool pool.Pool
 	seq  uint64
 }
 
 func newRpcClient(opt ...Option) Client {
-	opts := newOptions(opt...)
+	opts := NewOptions(opt...)
+
+	p := pool.NewPool(
+		pool.Size(opts.PoolSize),
+		pool.TTL(opts.PoolTTL),
+		pool.Transport(opts.Transport),
+	)
 
 	rc := &rpcClient{
-		once: sync.Once{},
 		opts: opts,
-		pool: newPool(opts.PoolSize, opts.PoolTTL),
+		pool: p,
 		seq:  0,
 	}
+	rc.once.Store(false)
 
 	c := Client(rc)
 
@@ -60,9 +65,6 @@ func (r *rpcClient) newCodec(contentType string) (codec.NewCodec, error) {
 
 func (r *rpcClient) call(ctx context.Context, node *registry.Node, req Request, resp interface{}, opts CallOptions) error {
 	address := node.Address
-	if node.Port > 0 {
-		address = fmt.Sprintf("%s:%d", address, node.Port)
-	}
 
 	msg := &transport.Message{
 		Header: make(map[string]string),
@@ -71,6 +73,11 @@ func (r *rpcClient) call(ctx context.Context, node *registry.Node, req Request, 
 	md, ok := metadata.FromContext(ctx)
 	if ok {
 		for k, v := range md {
+			// don't copy Micro-Topic header, that used for pub/sub
+			// this fix case then client uses the same context that received in subscriber
+			if k == "Micro-Topic" {
+				continue
+			}
 			msg.Header[k] = v
 		}
 	}
@@ -94,19 +101,22 @@ func (r *rpcClient) call(ctx context.Context, node *registry.Node, req Request, 
 		}
 	}
 
-	var grr error
-	c, err := r.pool.getConn(address, r.opts.Transport, transport.WithTimeout(opts.DialTimeout))
+	dOpts := []transport.DialOption{
+		transport.WithStream(),
+	}
+
+	if opts.DialTimeout >= 0 {
+		dOpts = append(dOpts, transport.WithTimeout(opts.DialTimeout))
+	}
+
+	c, err := r.pool.Get(address, dOpts...)
 	if err != nil {
 		return errors.InternalServerError("go.micro.client", "connection error: %v", err)
 	}
-	defer func() {
-		// defer execution of release
-		r.pool.release(address, c, grr)
-	}()
 
 	seq := atomic.LoadUint64(&r.seq)
 	atomic.AddUint64(&r.seq, 1)
-	codec := newRpcCodec(msg, c, cf)
+	codec := newRpcCodec(msg, c, cf, "")
 
 	rsp := &rpcResponse{
 		socket: c,
@@ -114,15 +124,19 @@ func (r *rpcClient) call(ctx context.Context, node *registry.Node, req Request, 
 	}
 
 	stream := &rpcStream{
+		id:       fmt.Sprintf("%v", seq),
 		context:  ctx,
 		request:  req,
 		response: rsp,
 		codec:    codec,
 		closed:   make(chan bool),
-		id:       fmt.Sprintf("%v", seq),
+		release:  func(err error) { r.pool.Release(c, err) },
+		sendEOS:  false,
 	}
+	// close the stream on exiting this function
 	defer stream.Close()
 
+	// wait for error response
 	ch := make(chan error, 1)
 
 	go func() {
@@ -148,21 +162,29 @@ func (r *rpcClient) call(ctx context.Context, node *registry.Node, req Request, 
 		ch <- nil
 	}()
 
+	var grr error
+
 	select {
 	case err := <-ch:
-		grr = err
 		return err
 	case <-ctx.Done():
-		grr = ctx.Err()
-		return errors.Timeout("go.micro.client", fmt.Sprintf("%v", ctx.Err()))
+		grr = errors.Timeout("go.micro.client", fmt.Sprintf("%v", ctx.Err()))
 	}
+
+	// set the stream error
+	if grr != nil {
+		stream.Lock()
+		stream.err = grr
+		stream.Unlock()
+
+		return grr
+	}
+
+	return nil
 }
 
 func (r *rpcClient) stream(ctx context.Context, node *registry.Node, req Request, opts CallOptions) (Stream, error) {
 	address := node.Address
-	if node.Port > 0 {
-		address = fmt.Sprintf("%s:%d", address, node.Port)
-	}
 
 	msg := &transport.Message{
 		Header: make(map[string]string),
@@ -176,7 +198,9 @@ func (r *rpcClient) stream(ctx context.Context, node *registry.Node, req Request
 	}
 
 	// set timeout in nanoseconds
-	msg.Header["Timeout"] = fmt.Sprintf("%d", opts.RequestTimeout)
+	if opts.StreamTimeout > time.Duration(0) {
+		msg.Header["Timeout"] = fmt.Sprintf("%d", opts.StreamTimeout)
+	}
 	// set the content type for the request
 	msg.Header["Content-Type"] = req.ContentType()
 	// set the accept header
@@ -207,7 +231,13 @@ func (r *rpcClient) stream(ctx context.Context, node *registry.Node, req Request
 		return nil, errors.InternalServerError("go.micro.client", "connection error: %v", err)
 	}
 
-	codec := newRpcCodec(msg, c, cf)
+	// increment the sequence number
+	seq := atomic.LoadUint64(&r.seq)
+	atomic.AddUint64(&r.seq, 1)
+	id := fmt.Sprintf("%v", seq)
+
+	// create codec with stream id
+	codec := newRpcCodec(msg, c, cf, id)
 
 	rsp := &rpcResponse{
 		socket: c,
@@ -220,16 +250,24 @@ func (r *rpcClient) stream(ctx context.Context, node *registry.Node, req Request
 	}
 
 	stream := &rpcStream{
+		id:       id,
 		context:  ctx,
 		request:  req,
 		response: rsp,
-		closed:   make(chan bool),
 		codec:    codec,
+		// used to close the stream
+		closed: make(chan bool),
+		// signal the end of stream,
+		sendEOS: true,
+		// release func
+		release: func(err error) { c.Close() },
 	}
 
+	// wait for error response
 	ch := make(chan error, 1)
 
 	go func() {
+		// send the first message
 		ch <- stream.Send(req.Body())
 	}()
 
@@ -243,6 +281,12 @@ func (r *rpcClient) stream(ctx context.Context, node *registry.Node, req Request
 	}
 
 	if grr != nil {
+		// set the error
+		stream.Lock()
+		stream.err = grr
+		stream.Unlock()
+
+		// close the stream
 		stream.Close()
 		return nil, grr
 	}
@@ -253,17 +297,22 @@ func (r *rpcClient) stream(ctx context.Context, node *registry.Node, req Request
 func (r *rpcClient) Init(opts ...Option) error {
 	size := r.opts.PoolSize
 	ttl := r.opts.PoolTTL
+	tr := r.opts.Transport
 
 	for _, o := range opts {
 		o(&r.opts)
 	}
 
 	// update pool configuration if the options changed
-	if size != r.opts.PoolSize || ttl != r.opts.PoolTTL {
-		r.pool.Lock()
-		r.pool.size = r.opts.PoolSize
-		r.pool.ttl = int64(r.opts.PoolTTL.Seconds())
-		r.pool.Unlock()
+	if size != r.opts.PoolSize || ttl != r.opts.PoolTTL || tr != r.opts.Transport {
+		// close existing pool
+		r.pool.Close()
+		// create new pool
+		r.pool = pool.NewPool(
+			pool.Size(r.opts.PoolSize),
+			pool.TTL(r.opts.PoolTTL),
+			pool.Transport(r.opts.Transport),
+		)
 	}
 
 	return nil
@@ -273,44 +322,66 @@ func (r *rpcClient) Options() Options {
 	return r.opts
 }
 
+// hasProxy checks if we have proxy set in the environment
+func (r *rpcClient) hasProxy() bool {
+	// get proxy
+	if prx := os.Getenv("MICRO_PROXY"); len(prx) > 0 {
+		return true
+	}
+
+	// get proxy address
+	if prx := os.Getenv("MICRO_PROXY_ADDRESS"); len(prx) > 0 {
+		return true
+	}
+
+	return false
+}
+
+// next returns an iterator for the next nodes to call
 func (r *rpcClient) next(request Request, opts CallOptions) (selector.Next, error) {
 	service := request.Service()
 
 	// get proxy
 	if prx := os.Getenv("MICRO_PROXY"); len(prx) > 0 {
+		// default name
+		if prx == "service" {
+			prx = "go.micro.proxy"
+		}
 		service = prx
 	}
 
 	// get proxy address
 	if prx := os.Getenv("MICRO_PROXY_ADDRESS"); len(prx) > 0 {
-		opts.Address = prx
+		opts.Address = []string{prx}
 	}
 
 	// return remote address
 	if len(opts.Address) > 0 {
-		address := opts.Address
-		port := 0
+		nodes := make([]*registry.Node, len(opts.Address))
 
-		host, sport, err := net.SplitHostPort(opts.Address)
-		if err == nil {
-			address = host
-			port, _ = strconv.Atoi(sport)
+		for i, address := range opts.Address {
+			nodes[i] = &registry.Node{
+				Address: address,
+				// Set the protocol
+				Metadata: map[string]string{
+					"protocol": "mucp",
+				},
+			}
 		}
 
+		// crude return method
 		return func() (*registry.Node, error) {
-			return &registry.Node{
-				Address: address,
-				Port:    port,
-			}, nil
+			return nodes[time.Now().Unix()%int64(len(nodes))], nil
 		}, nil
 	}
 
 	// get next nodes from the selector
 	next, err := r.opts.Selector.Select(service, opts.SelectOptions...)
-	if err != nil && err == selector.ErrNotFound {
-		return nil, errors.NotFound("go.micro.client", "service %s: %v", service, err.Error())
-	} else if err != nil {
-		return nil, errors.InternalServerError("go.micro.client", "error selecting %s node: %v", service, err.Error())
+	if err != nil {
+		if err == selector.ErrNotFound {
+			return nil, errors.InternalServerError("go.micro.client", "service %s: %s", service, err.Error())
+		}
+		return nil, errors.InternalServerError("go.micro.client", "error selecting %s node: %s", service, err.Error())
 	}
 
 	return next, nil
@@ -332,7 +403,9 @@ func (r *rpcClient) Call(ctx context.Context, request Request, response interfac
 	d, ok := ctx.Deadline()
 	if !ok {
 		// no deadline so we create a new one
-		ctx, _ = context.WithTimeout(ctx, callOpts.RequestTimeout)
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, callOpts.RequestTimeout)
+		defer cancel()
 	} else {
 		// got a deadline so no need to setup context
 		// but we need to set the timeout we pass along
@@ -370,22 +443,32 @@ func (r *rpcClient) Call(ctx context.Context, request Request, response interfac
 
 		// select next node
 		node, err := next()
-		if err != nil && err == selector.ErrNotFound {
-			return errors.NotFound("go.micro.client", "service %s: %v", request.Service(), err.Error())
-		} else if err != nil {
-			return errors.InternalServerError("go.micro.client", "error getting next %s node: %v", request.Service(), err.Error())
+		service := request.Service()
+		if err != nil {
+			if err == selector.ErrNotFound {
+				return errors.InternalServerError("go.micro.client", "service %s: %s", service, err.Error())
+			}
+			return errors.InternalServerError("go.micro.client", "error getting next %s node: %s", service, err.Error())
 		}
 
 		// make the call
 		err = rcall(ctx, node, request, response, callOpts)
-		r.opts.Selector.Mark(request.Service(), node, err)
+		r.opts.Selector.Mark(service, node, err)
 		return err
 	}
 
-	ch := make(chan error, callOpts.Retries+1)
+	// get the retries
+	retries := callOpts.Retries
+
+	// disable retries when using a proxy
+	if r.hasProxy() {
+		retries = 0
+	}
+
+	ch := make(chan error, retries+1)
 	var gerr error
 
-	for i := 0; i <= callOpts.Retries; i++ {
+	for i := 0; i <= retries; i++ {
 		go func(i int) {
 			ch <- call(i)
 		}(i)
@@ -447,14 +530,16 @@ func (r *rpcClient) Stream(ctx context.Context, request Request, opts ...CallOpt
 		}
 
 		node, err := next()
-		if err != nil && err == selector.ErrNotFound {
-			return nil, errors.NotFound("go.micro.client", "service %s: %v", request.Service(), err.Error())
-		} else if err != nil {
-			return nil, errors.InternalServerError("go.micro.client", "error getting next %s node: %v", request.Service(), err.Error())
+		service := request.Service()
+		if err != nil {
+			if err == selector.ErrNotFound {
+				return nil, errors.InternalServerError("go.micro.client", "service %s: %s", service, err.Error())
+			}
+			return nil, errors.InternalServerError("go.micro.client", "error getting next %s node: %s", service, err.Error())
 		}
 
 		stream, err := r.stream(ctx, node, request, callOpts)
-		r.opts.Selector.Mark(request.Service(), node, err)
+		r.opts.Selector.Mark(service, node, err)
 		return stream, err
 	}
 
@@ -463,14 +548,22 @@ func (r *rpcClient) Stream(ctx context.Context, request Request, opts ...CallOpt
 		err    error
 	}
 
-	ch := make(chan response, callOpts.Retries+1)
+	// get the retries
+	retries := callOpts.Retries
+
+	// disable retries when using a proxy
+	if r.hasProxy() {
+		retries = 0
+	}
+
+	ch := make(chan response, retries+1)
 	var grr error
 
-	for i := 0; i <= callOpts.Retries; i++ {
-		go func() {
+	for i := 0; i <= retries; i++ {
+		go func(i int) {
 			s, err := call(i)
 			ch <- response{s, err}
-		}()
+		}(i)
 
 		select {
 		case <-ctx.Done():
@@ -518,11 +611,6 @@ func (r *rpcClient) Publish(ctx context.Context, msg Message, opts ...PublishOpt
 	// set the topic
 	topic := msg.Topic()
 
-	// get proxy
-	if prx := os.Getenv("MICRO_PROXY"); len(prx) > 0 {
-		options.Exchange = prx
-	}
-
 	// get the exchange
 	if len(options.Exchange) > 0 {
 		topic = options.Exchange
@@ -533,24 +621,41 @@ func (r *rpcClient) Publish(ctx context.Context, msg Message, opts ...PublishOpt
 	if err != nil {
 		return errors.InternalServerError("go.micro.client", err.Error())
 	}
-	b := &buffer{bytes.NewBuffer(nil)}
-	if err := cf(b).Write(&codec.Message{
-		Target: topic,
-		Type:   codec.Publication,
-		Header: map[string]string{
-			"Micro-Id":    id,
-			"Micro-Topic": msg.Topic(),
-		},
-	}, msg.Payload()); err != nil {
-		return errors.InternalServerError("go.micro.client", err.Error())
+
+	var body []byte
+
+	// passed in raw data
+	if d, ok := msg.Payload().(*raw.Frame); ok {
+		body = d.Data
+	} else {
+		// new buffer
+		b := buf.New(nil)
+
+		if err := cf(b).Write(&codec.Message{
+			Target: topic,
+			Type:   codec.Event,
+			Header: map[string]string{
+				"Micro-Id":    id,
+				"Micro-Topic": msg.Topic(),
+			},
+		}, msg.Payload()); err != nil {
+			return errors.InternalServerError("go.micro.client", err.Error())
+		}
+
+		// set the body
+		body = b.Bytes()
 	}
-	r.once.Do(func() {
-		r.opts.Broker.Connect()
-	})
+
+	if !r.once.Load().(bool) {
+		if err = r.opts.Broker.Connect(); err != nil {
+			return errors.InternalServerError("go.micro.client", err.Error())
+		}
+		r.once.Store(true)
+	}
 
 	return r.opts.Broker.Publish(topic, &broker.Message{
 		Header: md,
-		Body:   b.Bytes(),
+		Body:   body,
 	})
 }
 
@@ -563,5 +668,5 @@ func (r *rpcClient) NewRequest(service, method string, request interface{}, reqO
 }
 
 func (r *rpcClient) String() string {
-	return "rpc"
+	return "mucp"
 }

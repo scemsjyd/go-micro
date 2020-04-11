@@ -1,6 +1,6 @@
-# Go Micro [![License](https://img.shields.io/:license-apache-blue.svg)](https://opensource.org/licenses/Apache-2.0) [![GoDoc](https://godoc.org/github.com/micro/go-micro?status.svg)](https://godoc.org/github.com/micro/go-micro) [![Travis CI](https://api.travis-ci.org/micro/go-micro.svg?branch=master)](https://travis-ci.org/micro/go-micro) [![Go Report Card](https://goreportcard.com/badge/micro/go-micro)](https://goreportcard.com/report/github.com/micro/go-micro)
+# Go Micro [![License](https://img.shields.io/:license-apache-blue.svg)](https://opensource.org/licenses/Apache-2.0) [![Go.Dev reference](https://img.shields.io/badge/go.dev-reference-007d9c?logo=go&logoColor=white&style=flat-square)](https://pkg.go.dev/github.com/micro/go-micro?tab=doc) [![Travis CI](https://api.travis-ci.org/micro/go-micro.svg?branch=master)](https://travis-ci.org/micro/go-micro) [![Go Report Card](https://goreportcard.com/badge/micro/go-micro)](https://goreportcard.com/report/github.com/micro/go-micro)
 
-Go Micro is a framework for micro service development.
+Go Micro is a framework for microservice development.
 
 ## Overview
 
@@ -12,7 +12,7 @@ but everything can be easily swapped out.
 
 Plugins are available at [github.com/micro/go-plugins](https://github.com/micro/go-plugins).
 
-Follow us on [Twitter](https://twitter.com/microhq) or join the [Slack](http://slack.micro.mu/) community.
+Follow us on [Twitter](https://twitter.com/microhq) or join the [Community](https://micro.mu/slack).
 
 ## Features
 
@@ -20,8 +20,7 @@ Go Micro abstracts away the details of distributed systems. Here are the main fe
 
 - **Service Discovery** - Automatic service registration and name resolution. Service discovery is at the core of micro service 
 development. When service A needs to speak to service B it needs the location of that service. The default discovery mechanism is 
-multicast DNS (mdns), a zeroconf system. You can optionally set gossip using the SWIM protocol for p2p networks or consul for a
-resilient cloud-native setup.
+multicast DNS (mdns), a zeroconf system.
 
 - **Load Balancing** - Client side load balancing built on service discovery. Once we have the addresses of any number of instances 
 of a service we now need a way to decide which node to route to. We use random hashed load balancing to provide even distribution 
@@ -33,11 +32,11 @@ and server handle this by default. This includes protobuf and json by default.
 
 - **Request/Response** - RPC based request/response with support for bidirectional streaming. We provide an abstraction for synchronous 
 communication. A request made to a service will be automatically resolved, load balanced, dialled and streamed. The default 
-transport is http/1.1 or http2 when tls is enabled.
+transport is [gRPC](https://grpc.io/).
 
 - **Async Messaging** - PubSub is built in as a first class citizen for asynchronous communication and event driven architectures. 
-Event notifications are a core pattern in micro service development. The default messaging is point-to-point http/1.1 or http2 when tls 
-is enabled.
+Event notifications are a core pattern in micro service development. The default messaging system is an embedded [NATS](https://nats.io/) 
+server.
 
 - **Pluggable Interfaces** - Go Micro makes use of Go interfaces for each distributed system abstraction. Because of this these interfaces 
 are pluggable and allows Go Micro to be runtime agnostic. You can plugin any underlying technology. Find plugins in 
@@ -45,10 +44,4 @@ are pluggable and allows Go Micro to be runtime agnostic. You can plugin any und
 
 ## Getting Started
 
-See the [docs](https://micro.mu/docs/go-micro.html) for detailed information on the architecture, installation and use of go-micro.
-
-## Sponsors
-
-Sixt is an Enterprise Sponsor of Micro
-
-<a href="https://micro.mu/blog/2016/04/25/announcing-sixt-sponsorship.html"><img src="https://micro.mu/sixt_logo.png" width=150px height="auto" /></a>
+See the [docs](https://micro.mu/docs/framework.html) for detailed information on the architecture, installation and use of go-micro.

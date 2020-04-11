@@ -1,8 +1,11 @@
 package server
 
 import (
-	"github.com/micro/go-micro/codec"
-	"github.com/micro/go-micro/transport"
+	"bytes"
+
+	"github.com/micro/go-micro/v2/codec"
+	"github.com/micro/go-micro/v2/transport"
+	"github.com/micro/go-micro/v2/util/buf"
 )
 
 type rpcRequest struct {
@@ -14,13 +17,18 @@ type rpcRequest struct {
 	codec       codec.Codec
 	header      map[string]string
 	body        []byte
+	rawBody     interface{}
 	stream      bool
+	first       bool
 }
 
 type rpcMessage struct {
 	topic       string
 	contentType string
 	payload     interface{}
+	header      map[string]string
+	body        []byte
+	codec       codec.NewCodec
 }
 
 func (r *rpcRequest) Codec() codec.Reader {
@@ -48,15 +56,14 @@ func (r *rpcRequest) Header() map[string]string {
 }
 
 func (r *rpcRequest) Body() interface{} {
-	// TODO: convert to interface value
-	return r.body
+	return r.rawBody
 }
 
 func (r *rpcRequest) Read() ([]byte, error) {
 	// got a body
-	if r.body != nil {
+	if r.first {
 		b := r.body
-		r.body = nil
+		r.first = false
 		return b, nil
 	}
 
@@ -84,4 +91,17 @@ func (r *rpcMessage) Topic() string {
 
 func (r *rpcMessage) Payload() interface{} {
 	return r.payload
+}
+
+func (r *rpcMessage) Header() map[string]string {
+	return r.header
+}
+
+func (r *rpcMessage) Body() []byte {
+	return r.body
+}
+
+func (r *rpcMessage) Codec() codec.Reader {
+	b := buf.New(bytes.NewBuffer(r.body))
+	return r.codec(b)
 }

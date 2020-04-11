@@ -1,16 +1,17 @@
 package memory
 
 import (
+	"os"
 	"testing"
 
-	"github.com/micro/go-micro/transport"
+	"github.com/micro/go-micro/v2/transport"
 )
 
 func TestMemoryTransport(t *testing.T) {
 	tr := NewTransport()
 
 	// bind / listen
-	l, err := tr.Listen("localhost:8080")
+	l, err := tr.Listen("127.0.0.1:8080")
 	if err != nil {
 		t.Fatalf("Unexpected error listening %v", err)
 	}
@@ -24,7 +25,9 @@ func TestMemoryTransport(t *testing.T) {
 				if err := sock.Recv(&m); err != nil {
 					return
 				}
-				t.Logf("Server Received %s", string(m.Body))
+				if len(os.Getenv("IN_TRAVIS_CI")) == 0 {
+					t.Logf("Server Received %s", string(m.Body))
+				}
 				if err := sock.Send(&transport.Message{
 					Body: []byte(`pong`),
 				}); err != nil {
@@ -37,7 +40,7 @@ func TestMemoryTransport(t *testing.T) {
 	}()
 
 	// dial
-	c, err := tr.Dial("localhost:8080")
+	c, err := tr.Dial("127.0.0.1:8080")
 	if err != nil {
 		t.Fatalf("Unexpected error dialing %v", err)
 	}
@@ -54,7 +57,9 @@ func TestMemoryTransport(t *testing.T) {
 		if err := c.Recv(&m); err != nil {
 			return
 		}
-		t.Logf("Client Received %s", string(m.Body))
+		if len(os.Getenv("IN_TRAVIS_CI")) == 0 {
+			t.Logf("Client Received %s", string(m.Body))
+		}
 	}
 
 }

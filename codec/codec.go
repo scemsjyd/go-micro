@@ -2,6 +2,7 @@
 package codec
 
 import (
+	"errors"
 	"io"
 )
 
@@ -9,7 +10,11 @@ const (
 	Error MessageType = iota
 	Request
 	Response
-	Publication
+	Event
+)
+
+var (
+	ErrInvalidMessage = errors.New("invalid message")
 )
 
 type MessageType int

@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/micro/go-micro/server"
+	"github.com/micro/go-micro/v2/server"
 )
 
 type function struct {
@@ -54,7 +54,7 @@ func newFunction(opts ...Option) Function {
 
 	service.Server().Init(
 		// ensure the service waits for requests to finish
-		server.Wait(true),
+		server.Wait(nil),
 		// wrap handlers and subscribers to finish execution
 		server.WrapHandler(fnHandlerWrapper(fn)),
 		server.WrapSubscriber(fnSubWrapper(fn)),

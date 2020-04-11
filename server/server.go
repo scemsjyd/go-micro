@@ -6,11 +6,12 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/google/uuid"
-	"github.com/micro/go-log"
-	"github.com/micro/go-micro/codec"
-	"github.com/micro/go-micro/registry"
+	"github.com/micro/go-micro/v2/codec"
+	"github.com/micro/go-micro/v2/logger"
+	"github.com/micro/go-micro/v2/registry"
 )
 
 // Server is a simple micro server abstraction
@@ -28,15 +29,26 @@ type Server interface {
 
 // Router handle serving messages
 type Router interface {
+	// ProcessMessage processes a message
+	ProcessMessage(context.Context, Message) error
 	// ServeRequest processes a request to completion
 	ServeRequest(context.Context, Request, Response) error
 }
 
 // Message is an async message interface
 type Message interface {
+	// Topic of the message
 	Topic() string
+	// The decoded payload value
 	Payload() interface{}
+	// The content type of the payload
 	ContentType() string
+	// The raw headers of the message
+	Header() map[string]string
+	// The raw body of the message
+	Body() []byte
+	// Codec used to decode the message
+	Codec() codec.Reader
 }
 
 // Request is a synchronous request interface
@@ -115,12 +127,19 @@ type Subscriber interface {
 type Option func(*Options)
 
 var (
-	DefaultAddress        = ":0"
-	DefaultName           = "server"
-	DefaultVersion        = "latest"
-	DefaultId             = uuid.New().String()
-	DefaultServer  Server = newRpcServer()
-	DefaultRouter         = newRpcRouter()
+	DefaultAddress                 = ":0"
+	DefaultName                    = "go.micro.server"
+	DefaultVersion                 = "latest"
+	DefaultId                      = uuid.New().String()
+	DefaultServer           Server = newRpcServer()
+	DefaultRouter                  = newRpcRouter()
+	DefaultRegisterCheck           = func(context.Context) error { return nil }
+	DefaultRegisterInterval        = time.Second * 30
+	DefaultRegisterTTL             = time.Minute
+
+	// NewServer creates a new server
+	NewServer func(...Option) Server = newRpcServer
+	log                              = logger.NewHelper(logger.DefaultLogger).WithFields(map[string]interface{}{"service": "server"})
 )
 
 // DefaultOptions returns config options for the default service
@@ -136,9 +155,9 @@ func Init(opt ...Option) {
 	DefaultServer.Init(opt...)
 }
 
-// NewServer returns a new server with options passed in
-func NewServer(opt ...Option) Server {
-	return newRpcServer(opt...)
+// NewRouter returns a new router
+func NewRouter() *router {
+	return newRpcRouter()
 }
 
 // NewSubscriber creates a new subscriber interface with the given topic
@@ -181,22 +200,27 @@ func Run() error {
 	}
 
 	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT, syscall.SIGKILL)
-	log.Logf("Received signal %s", <-ch)
-
+	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT)
+	if logger.V(logger.InfoLevel, log) {
+		log.Infof("Received signal %s", <-ch)
+	}
 	return Stop()
 }
 
 // Start starts the default server
 func Start() error {
 	config := DefaultServer.Options()
-	log.Logf("Starting server %s id %s", config.Name, config.Id)
+	if logger.V(logger.InfoLevel, log) {
+		log.Infof("Starting server %s id %s", config.Name, config.Id)
+	}
 	return DefaultServer.Start()
 }
 
 // Stop stops the default server
 func Stop() error {
-	log.Logf("Stopping server")
+	if logger.V(logger.InfoLevel, log) {
+		log.Infof("Stopping server")
+	}
 	return DefaultServer.Stop()
 }
 

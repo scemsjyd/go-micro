@@ -2,14 +2,27 @@
 package registry
 
 import (
+	"bytes"
+	"compress/zlib"
 	"context"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/micro/go-micro/v2/logger"
 	"github.com/micro/mdns"
-	hash "github.com/mitchellh/hashstructure"
+)
+
+var (
+	// use a .micro domain rather than .local
+	mdnsDomain = "micro"
 )
 
 type mdnsTxt struct {
@@ -20,26 +33,112 @@ type mdnsTxt struct {
 }
 
 type mdnsEntry struct {
-	hash uint64
 	id   string
 	node *mdns.Server
 }
 
 type mdnsRegistry struct {
 	opts Options
+	// the mdns domain
+	domain string
 
 	sync.Mutex
 	services map[string][]*mdnsEntry
+
+	mtx sync.RWMutex
+
+	// watchers
+	watchers map[string]*mdnsWatcher
+
+	// listener
+	listener chan *mdns.ServiceEntry
 }
 
+func encode(txt *mdnsTxt) ([]string, error) {
+	b, err := json.Marshal(txt)
+	if err != nil {
+		return nil, err
+	}
+
+	var buf bytes.Buffer
+	defer buf.Reset()
+
+	w := zlib.NewWriter(&buf)
+	if _, err := w.Write(b); err != nil {
+		return nil, err
+	}
+	w.Close()
+
+	encoded := hex.EncodeToString(buf.Bytes())
+
+	// individual txt limit
+	if len(encoded) <= 255 {
+		return []string{encoded}, nil
+	}
+
+	// split encoded string
+	var record []string
+
+	for len(encoded) > 255 {
+		record = append(record, encoded[:255])
+		encoded = encoded[255:]
+	}
+
+	record = append(record, encoded)
+
+	return record, nil
+}
+
+func decode(record []string) (*mdnsTxt, error) {
+	encoded := strings.Join(record, "")
+
+	hr, err := hex.DecodeString(encoded)
+	if err != nil {
+		return nil, err
+	}
+
+	br := bytes.NewReader(hr)
+	zr, err := zlib.NewReader(br)
+	if err != nil {
+		return nil, err
+	}
+
+	rbuf, err := ioutil.ReadAll(zr)
+	if err != nil {
+		return nil, err
+	}
+
+	var txt *mdnsTxt
+
+	if err := json.Unmarshal(rbuf, &txt); err != nil {
+		return nil, err
+	}
+
+	return txt, nil
+}
 func newRegistry(opts ...Option) Registry {
 	options := Options{
+		Context: context.Background(),
 		Timeout: time.Millisecond * 100,
+	}
+
+	for _, o := range opts {
+		o(&options)
+	}
+
+	// set the domain
+	domain := mdnsDomain
+
+	d, ok := options.Context.Value("mdns.domain").(string)
+	if ok {
+		domain = d
 	}
 
 	return &mdnsRegistry{
 		opts:     options,
+		domain:   domain,
 		services: make(map[string][]*mdnsEntry),
+		watchers: make(map[string]*mdnsWatcher),
 	}
 }
 
@@ -64,7 +163,7 @@ func (m *mdnsRegistry) Register(service *Service, opts ...RegisterOption) error 
 		s, err := mdns.NewMDNSService(
 			service.Name,
 			"_services",
-			"",
+			m.domain+".",
 			"",
 			9999,
 			[]net.IP{net.ParseIP("0.0.0.0")},
@@ -74,7 +173,7 @@ func (m *mdnsRegistry) Register(service *Service, opts ...RegisterOption) error 
 			return err
 		}
 
-		srv, err := mdns.NewServer(&mdns.Config{Zone: &mdns.DNSSDService{s}})
+		srv, err := mdns.NewServer(&mdns.Config{Zone: &mdns.DNSSDService{MDNSService: s}})
 		if err != nil {
 			return err
 		}
@@ -86,13 +185,6 @@ func (m *mdnsRegistry) Register(service *Service, opts ...RegisterOption) error 
 	var gerr error
 
 	for _, node := range service.Nodes {
-		// create hash of service; uint64
-		h, err := hash.Hash(node, nil)
-		if err != nil {
-			gerr = err
-			continue
-		}
-
 		var seen bool
 		var e *mdnsEntry
 
@@ -105,14 +197,11 @@ func (m *mdnsRegistry) Register(service *Service, opts ...RegisterOption) error 
 		}
 
 		// already registered, continue
-		if seen && e.hash == h {
+		if seen {
 			continue
-			// hash doesn't match, shutdown
-		} else if seen {
-			e.node.Shutdown()
 			// doesn't exist
 		} else {
-			e = &mdnsEntry{hash: h}
+			e = &mdnsEntry{}
 		}
 
 		txt, err := encode(&mdnsTxt{
@@ -127,14 +216,24 @@ func (m *mdnsRegistry) Register(service *Service, opts ...RegisterOption) error 
 			continue
 		}
 
+		host, pt, err := net.SplitHostPort(node.Address)
+		if err != nil {
+			gerr = err
+			continue
+		}
+		port, _ := strconv.Atoi(pt)
+
+		if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+			logger.Debugf("[mdns] registry create new service with ip: %s for: %s", net.ParseIP(host).String(), host)
+		}
 		// we got here, new node
 		s, err := mdns.NewMDNSService(
 			node.Id,
 			service.Name,
+			m.domain+".",
 			"",
-			"",
-			node.Port,
-			[]net.IP{net.ParseIP(node.Address)},
+			port,
+			[]net.IP{net.ParseIP(host)},
 			txt,
 		)
 		if err != nil {
@@ -201,9 +300,13 @@ func (m *mdnsRegistry) GetService(service string) ([]*Service, error) {
 
 	p := mdns.DefaultParams(service)
 	// set context with timeout
-	p.Context, _ = context.WithTimeout(context.Background(), m.opts.Timeout)
+	var cancel context.CancelFunc
+	p.Context, cancel = context.WithTimeout(context.Background(), m.opts.Timeout)
+	defer cancel()
 	// set entries channel
 	p.Entries = entries
+	// set the domain
+	p.Domain = m.domain
 
 	go func() {
 		for {
@@ -213,7 +316,9 @@ func (m *mdnsRegistry) GetService(service string) ([]*Service, error) {
 				if p.Service == "_services" {
 					continue
 				}
-
+				if p.Domain != m.domain {
+					continue
+				}
 				if e.TTL == 0 {
 					continue
 				}
@@ -235,11 +340,22 @@ func (m *mdnsRegistry) GetService(service string) ([]*Service, error) {
 						Endpoints: txt.Endpoints,
 					}
 				}
-
+				addr := ""
+				// prefer ipv4 addrs
+				if e.AddrV4 != nil {
+					addr = e.AddrV4.String()
+					// else use ipv6
+				} else if e.AddrV6 != nil {
+					addr = "[" + e.AddrV6.String() + "]"
+				} else {
+					if logger.V(logger.InfoLevel, logger.DefaultLogger) {
+						logger.Infof("[mdns]: invalid endpoint received: %v", e)
+					}
+					continue
+				}
 				s.Nodes = append(s.Nodes, &Node{
 					Id:       strings.TrimSuffix(e.Name, "."+p.Service+"."+p.Domain+"."),
-					Address:  e.AddrV4.String(),
-					Port:     e.Port,
+					Address:  fmt.Sprintf("%s:%d", addr, e.Port),
 					Metadata: txt.Metadata,
 				})
 
@@ -260,7 +376,7 @@ func (m *mdnsRegistry) GetService(service string) ([]*Service, error) {
 	<-done
 
 	// create list and return
-	var services []*Service
+	services := make([]*Service, 0, len(serviceMap))
 
 	for _, service := range serviceMap {
 		services = append(services, service)
@@ -276,9 +392,13 @@ func (m *mdnsRegistry) ListServices() ([]*Service, error) {
 
 	p := mdns.DefaultParams("_services")
 	// set context with timeout
-	p.Context, _ = context.WithTimeout(context.Background(), m.opts.Timeout)
+	var cancel context.CancelFunc
+	p.Context, cancel = context.WithTimeout(context.Background(), m.opts.Timeout)
+	defer cancel()
 	// set entries channel
 	p.Entries = entries
+	// set domain
+	p.Domain = m.domain
 
 	var services []*Service
 
@@ -289,7 +409,9 @@ func (m *mdnsRegistry) ListServices() ([]*Service, error) {
 				if e.TTL == 0 {
 					continue
 				}
-
+				if !strings.HasSuffix(e.Name, p.Domain+".") {
+					continue
+				}
 				name := strings.TrimSuffix(e.Name, "."+p.Service+"."+p.Domain+".")
 				if !serviceMap[name] {
 					serviceMap[name] = true
@@ -320,14 +442,88 @@ func (m *mdnsRegistry) Watch(opts ...WatchOption) (Watcher, error) {
 	}
 
 	md := &mdnsWatcher{
-		wo:   wo,
-		ch:   make(chan *mdns.ServiceEntry, 32),
-		exit: make(chan struct{}),
+		id:       uuid.New().String(),
+		wo:       wo,
+		ch:       make(chan *mdns.ServiceEntry, 32),
+		exit:     make(chan struct{}),
+		domain:   m.domain,
+		registry: m,
 	}
 
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+
+	// save the watcher
+	m.watchers[md.id] = md
+
+	// check of the listener exists
+	if m.listener != nil {
+		return md, nil
+	}
+
+	// start the listener
 	go func() {
-		if err := mdns.Listen(md.ch, md.exit); err != nil {
-			md.Stop()
+		// go to infinity
+		for {
+			m.mtx.Lock()
+
+			// just return if there are no watchers
+			if len(m.watchers) == 0 {
+				m.listener = nil
+				m.mtx.Unlock()
+				return
+			}
+
+			// check existing listener
+			if m.listener != nil {
+				m.mtx.Unlock()
+				return
+			}
+
+			// reset the listener
+			exit := make(chan struct{})
+			ch := make(chan *mdns.ServiceEntry, 32)
+			m.listener = ch
+
+			m.mtx.Unlock()
+
+			// send messages to the watchers
+			go func() {
+				send := func(w *mdnsWatcher, e *mdns.ServiceEntry) {
+					select {
+					case w.ch <- e:
+					default:
+					}
+				}
+
+				for {
+					select {
+					case <-exit:
+						return
+					case e, ok := <-ch:
+						if !ok {
+							return
+						}
+						m.mtx.RLock()
+						// send service entry to all watchers
+						for _, w := range m.watchers {
+							send(w, e)
+						}
+						m.mtx.RUnlock()
+					}
+				}
+
+			}()
+
+			// start listening, blocking call
+			mdns.Listen(ch, exit)
+
+			// mdns.Listen has unblocked
+			// kill the saved listener
+			m.mtx.Lock()
+			m.listener = nil
+			close(ch)
+			m.mtx.Unlock()
 		}
 	}()
 

@@ -7,35 +7,91 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/micro/go-micro/registry"
+	"github.com/micro/go-micro/v2/logger"
+	"github.com/micro/go-micro/v2/registry"
 )
+
+var (
+	sendEventTime = 10 * time.Millisecond
+	ttlPruneTime  = time.Second
+)
+
+type node struct {
+	*registry.Node
+	TTL      time.Duration
+	LastSeen time.Time
+}
+
+type record struct {
+	Name      string
+	Version   string
+	Metadata  map[string]string
+	Nodes     map[string]*node
+	Endpoints []*registry.Endpoint
+}
 
 type Registry struct {
 	options registry.Options
 
 	sync.RWMutex
-	Services map[string][]*registry.Service
-	Watchers map[string]*Watcher
+	records  map[string]map[string]*record
+	watchers map[string]*Watcher
 }
 
-var (
-	timeout = time.Millisecond * 10
-)
+func NewRegistry(opts ...registry.Option) registry.Registry {
+	options := registry.Options{
+		Context: context.Background(),
+	}
 
-// Setup sets mock data
-func (m *Registry) Setup() {
-	m.Lock()
-	defer m.Unlock()
+	for _, o := range opts {
+		o(&options)
+	}
 
-	// add some memory data
-	m.Services = Data
+	records := getServiceRecords(options.Context)
+	if records == nil {
+		records = make(map[string]map[string]*record)
+	}
+
+	reg := &Registry{
+		options:  options,
+		records:  records,
+		watchers: make(map[string]*Watcher),
+	}
+
+	go reg.ttlPrune()
+
+	return reg
 }
 
-func (m *Registry) watch(r *registry.Result) {
-	var watchers []*Watcher
+func (m *Registry) ttlPrune() {
+	prune := time.NewTicker(ttlPruneTime)
+	defer prune.Stop()
 
+	for {
+		select {
+		case <-prune.C:
+			m.Lock()
+			for name, records := range m.records {
+				for version, record := range records {
+					for id, n := range record.Nodes {
+						if n.TTL != 0 && time.Since(n.LastSeen) > n.TTL {
+							if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+								logger.Debugf("Registry TTL expired for node %s of service %s", n.Id, name)
+							}
+							delete(m.records[name][version].Nodes, id)
+						}
+					}
+				}
+			}
+			m.Unlock()
+		}
+	}
+}
+
+func (m *Registry) sendEvent(r *registry.Result) {
 	m.RLock()
-	for _, w := range m.Watchers {
+	watchers := make([]*Watcher, 0, len(m.watchers))
+	for _, w := range m.watchers {
 		watchers = append(watchers, w)
 	}
 	m.RUnlock()
@@ -44,12 +100,12 @@ func (m *Registry) watch(r *registry.Result) {
 		select {
 		case <-w.exit:
 			m.Lock()
-			delete(m.Watchers, w.id)
+			delete(m.watchers, w.id)
 			m.Unlock()
 		default:
 			select {
 			case w.res <- r:
-			case <-time.After(timeout):
+			case <-time.After(sendEventTime):
 			}
 		}
 	}
@@ -62,11 +118,24 @@ func (m *Registry) Init(opts ...registry.Option) error {
 
 	// add services
 	m.Lock()
-	for k, v := range getServices(m.options.Context) {
-		s := m.Services[k]
-		m.Services[k] = addServices(s, v)
+	defer m.Unlock()
+
+	records := getServiceRecords(m.options.Context)
+	for name, record := range records {
+		// add a whole new service including all of its versions
+		if _, ok := m.records[name]; !ok {
+			m.records[name] = record
+			continue
+		}
+		// add the versions of the service we dont track yet
+		for version, r := range record {
+			if _, ok := m.records[name][version]; !ok {
+				m.records[name][version] = r
+				continue
+			}
+		}
 	}
-	m.Unlock()
+
 	return nil
 }
 
@@ -74,45 +143,134 @@ func (m *Registry) Options() registry.Options {
 	return m.options
 }
 
-func (m *Registry) GetService(service string) ([]*registry.Service, error) {
-	m.RLock()
-	s, ok := m.Services[service]
-	if !ok || len(s) == 0 {
-		m.RUnlock()
-		return nil, registry.ErrNotFound
-	}
-	m.RUnlock()
-	return s, nil
-}
-
-func (m *Registry) ListServices() ([]*registry.Service, error) {
-	m.RLock()
-	var services []*registry.Service
-	for _, service := range m.Services {
-		services = append(services, service...)
-	}
-	m.RUnlock()
-	return services, nil
-}
-
 func (m *Registry) Register(s *registry.Service, opts ...registry.RegisterOption) error {
-	go m.watch(&registry.Result{Action: "update", Service: s})
-
 	m.Lock()
-	services := addServices(m.Services[s.Name], []*registry.Service{s})
-	m.Services[s.Name] = services
-	m.Unlock()
+	defer m.Unlock()
+
+	var options registry.RegisterOptions
+	for _, o := range opts {
+		o(&options)
+	}
+
+	r := serviceToRecord(s, options.TTL)
+
+	if _, ok := m.records[s.Name]; !ok {
+		m.records[s.Name] = make(map[string]*record)
+	}
+
+	if _, ok := m.records[s.Name][s.Version]; !ok {
+		m.records[s.Name][s.Version] = r
+		if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+			logger.Debugf("Registry added new service: %s, version: %s", s.Name, s.Version)
+		}
+		go m.sendEvent(&registry.Result{Action: "update", Service: s})
+		return nil
+	}
+
+	addedNodes := false
+	for _, n := range s.Nodes {
+		if _, ok := m.records[s.Name][s.Version].Nodes[n.Id]; !ok {
+			addedNodes = true
+			metadata := make(map[string]string)
+			for k, v := range n.Metadata {
+				metadata[k] = v
+				m.records[s.Name][s.Version].Nodes[n.Id] = &node{
+					Node: &registry.Node{
+						Id:       n.Id,
+						Address:  n.Address,
+						Metadata: metadata,
+					},
+					TTL:      options.TTL,
+					LastSeen: time.Now(),
+				}
+			}
+		}
+	}
+
+	if addedNodes {
+		if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+			logger.Debugf("Registry added new node to service: %s, version: %s", s.Name, s.Version)
+		}
+		go m.sendEvent(&registry.Result{Action: "update", Service: s})
+		return nil
+	}
+
+	// refresh TTL and timestamp
+	for _, n := range s.Nodes {
+		if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+			logger.Debugf("Updated registration for service: %s, version: %s", s.Name, s.Version)
+		}
+		m.records[s.Name][s.Version].Nodes[n.Id].TTL = options.TTL
+		m.records[s.Name][s.Version].Nodes[n.Id].LastSeen = time.Now()
+	}
+
 	return nil
 }
 
 func (m *Registry) Deregister(s *registry.Service) error {
-	go m.watch(&registry.Result{Action: "delete", Service: s})
-
 	m.Lock()
-	services := delServices(m.Services[s.Name], []*registry.Service{s})
-	m.Services[s.Name] = services
-	m.Unlock()
+	defer m.Unlock()
+
+	if _, ok := m.records[s.Name]; ok {
+		if _, ok := m.records[s.Name][s.Version]; ok {
+			for _, n := range s.Nodes {
+				if _, ok := m.records[s.Name][s.Version].Nodes[n.Id]; ok {
+					if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+						logger.Debugf("Registry removed node from service: %s, version: %s", s.Name, s.Version)
+					}
+					delete(m.records[s.Name][s.Version].Nodes, n.Id)
+				}
+			}
+			if len(m.records[s.Name][s.Version].Nodes) == 0 {
+				delete(m.records[s.Name], s.Version)
+				if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+					logger.Debugf("Registry removed service: %s, version: %s", s.Name, s.Version)
+				}
+			}
+		}
+		if len(m.records[s.Name]) == 0 {
+			delete(m.records, s.Name)
+			if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+				logger.Debugf("Registry removed service: %s", s.Name)
+			}
+		}
+		go m.sendEvent(&registry.Result{Action: "delete", Service: s})
+	}
+
 	return nil
+}
+
+func (m *Registry) GetService(name string) ([]*registry.Service, error) {
+	m.RLock()
+	defer m.RUnlock()
+
+	records, ok := m.records[name]
+	if !ok {
+		return nil, registry.ErrNotFound
+	}
+
+	services := make([]*registry.Service, len(m.records[name]))
+	i := 0
+	for _, record := range records {
+		services[i] = recordToService(record)
+		i++
+	}
+
+	return services, nil
+}
+
+func (m *Registry) ListServices() ([]*registry.Service, error) {
+	m.RLock()
+	defer m.RUnlock()
+
+	var services []*registry.Service
+	for _, records := range m.records {
+		for _, record := range records {
+			services = append(services, recordToService(record))
+		}
+	}
+
+	return services, nil
 }
 
 func (m *Registry) Watch(opts ...registry.WatchOption) (registry.Watcher, error) {
@@ -129,32 +287,12 @@ func (m *Registry) Watch(opts ...registry.WatchOption) (registry.Watcher, error)
 	}
 
 	m.Lock()
-	m.Watchers[w.id] = w
+	m.watchers[w.id] = w
 	m.Unlock()
+
 	return w, nil
 }
 
 func (m *Registry) String() string {
 	return "memory"
-}
-
-func NewRegistry(opts ...registry.Option) registry.Registry {
-	options := registry.Options{
-		Context: context.Background(),
-	}
-
-	for _, o := range opts {
-		o(&options)
-	}
-
-	services := getServices(options.Context)
-	if services == nil {
-		services = make(map[string][]*registry.Service)
-	}
-
-	return &Registry{
-		options:  options,
-		Services: services,
-		Watchers: make(map[string]*Watcher),
-	}
 }

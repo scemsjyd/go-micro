@@ -2,9 +2,11 @@ package server
 
 import (
 	"context"
+	"errors"
+	"io"
 	"sync"
 
-	"github.com/micro/go-micro/codec"
+	"github.com/micro/go-micro/v2/codec"
 )
 
 // Implements the Streamer interface
@@ -38,25 +40,54 @@ func (r *rpcStream) Send(msg interface{}) error {
 		Type:     codec.Response,
 	}
 
-	return r.codec.Write(&resp, msg)
+	if err := r.codec.Write(&resp, msg); err != nil {
+		r.err = err
+	}
+
+	return nil
 }
 
 func (r *rpcStream) Recv(msg interface{}) error {
-	r.Lock()
-	defer r.Unlock()
-
 	req := new(codec.Message)
 	req.Type = codec.Request
 
-	if err := r.codec.ReadHeader(req, req.Type); err != nil {
+	err := r.codec.ReadHeader(req, req.Type)
+	r.Lock()
+	defer r.Unlock()
+	if err != nil {
 		// discard body
 		r.codec.ReadBody(nil)
+		r.err = err
 		return err
+	}
+
+	// check the error
+	if len(req.Error) > 0 {
+		// Check the client closed the stream
+		switch req.Error {
+		case lastStreamResponseError.Error():
+			// discard body
+			r.Unlock()
+			r.codec.ReadBody(nil)
+			r.Lock()
+			r.err = io.EOF
+			return io.EOF
+		default:
+			return errors.New(req.Error)
+		}
 	}
 
 	// we need to stay up to date with sequence numbers
 	r.id = req.Id
-	return r.codec.ReadBody(msg)
+	r.Unlock()
+	err = r.codec.ReadBody(msg)
+	r.Lock()
+	if err != nil {
+		r.err = err
+		return err
+	}
+
+	return nil
 }
 
 func (r *rpcStream) Error() error {

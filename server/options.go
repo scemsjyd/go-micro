@@ -2,19 +2,24 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
+	"sync"
 	"time"
 
-	"github.com/micro/go-micro/broker"
-	"github.com/micro/go-micro/codec"
-	"github.com/micro/go-micro/registry"
-	"github.com/micro/go-micro/server/debug"
-	"github.com/micro/go-micro/transport"
+	"github.com/micro/go-micro/v2/auth"
+	"github.com/micro/go-micro/v2/broker"
+	"github.com/micro/go-micro/v2/codec"
+	"github.com/micro/go-micro/v2/debug/trace"
+	"github.com/micro/go-micro/v2/registry"
+	"github.com/micro/go-micro/v2/transport"
 )
 
 type Options struct {
 	Codecs       map[string]codec.NewCodec
 	Broker       broker.Broker
 	Registry     registry.Registry
+	Tracer       trace.Tracer
+	Auth         auth.Auth
 	Transport    transport.Transport
 	Metadata     map[string]string
 	Name         string
@@ -25,6 +30,8 @@ type Options struct {
 	HdlrWrappers []HandlerWrapper
 	SubWrappers  []SubscriberWrapper
 
+	// RegisterCheck runs a check function before registering the service
+	RegisterCheck func(context.Context) error
 	// The register expiry time
 	RegisterTTL time.Duration
 	// The interval on which to register
@@ -33,8 +40,8 @@ type Options struct {
 	// The router for requests
 	Router Router
 
-	// Debug Handler which can be set by a user
-	DebugHandler debug.DebugHandler
+	// TLSConfig specifies tls.Config for secure serving
+	TLSConfig *tls.Config
 
 	// Other options for implementations of the interface
 	// can be stored in a context
@@ -43,12 +50,18 @@ type Options struct {
 
 func newOptions(opt ...Option) Options {
 	opts := Options{
-		Codecs:   make(map[string]codec.NewCodec),
-		Metadata: map[string]string{},
+		Codecs:           make(map[string]codec.NewCodec),
+		Metadata:         map[string]string{},
+		RegisterInterval: DefaultRegisterInterval,
+		RegisterTTL:      DefaultRegisterTTL,
 	}
 
 	for _, o := range opt {
 		o(&opts)
+	}
+
+	if opts.Auth == nil {
+		opts.Auth = auth.DefaultAuth
 	}
 
 	if opts.Broker == nil {
@@ -63,8 +76,8 @@ func newOptions(opt ...Option) Options {
 		opts.Transport = transport.DefaultTransport
 	}
 
-	if opts.DebugHandler == nil {
-		opts.DebugHandler = debug.DefaultDebugHandler
+	if opts.RegisterCheck == nil {
+		opts.RegisterCheck = DefaultRegisterCheck
 	}
 
 	if len(opts.Address) == 0 {
@@ -135,10 +148,33 @@ func Codec(contentType string, c codec.NewCodec) Option {
 	}
 }
 
+// Context specifies a context for the service.
+// Can be used to signal shutdown of the service
+// Can be used for extra option values.
+func Context(ctx context.Context) Option {
+	return func(o *Options) {
+		o.Context = ctx
+	}
+}
+
 // Registry used for discovery
 func Registry(r registry.Registry) Option {
 	return func(o *Options) {
 		o.Registry = r
+	}
+}
+
+// Tracer mechanism for distributed tracking
+func Tracer(t trace.Tracer) Option {
+	return func(o *Options) {
+		o.Tracer = t
+	}
+}
+
+// Auth mechanism for role based access control
+func Auth(a auth.Auth) Option {
+	return func(o *Options) {
+		o.Auth = a
 	}
 }
 
@@ -149,17 +185,17 @@ func Transport(t transport.Transport) Option {
 	}
 }
 
-// DebugHandler for this server
-func DebugHandler(d debug.DebugHandler) Option {
-	return func(o *Options) {
-		o.DebugHandler = d
-	}
-}
-
 // Metadata associated with the server
 func Metadata(md map[string]string) Option {
 	return func(o *Options) {
 		o.Metadata = md
+	}
+}
+
+// RegisterCheck run func before registry service
+func RegisterCheck(fn func(context.Context) error) Option {
+	return func(o *Options) {
+		o.RegisterCheck = fn
 	}
 }
 
@@ -177,6 +213,26 @@ func RegisterInterval(t time.Duration) Option {
 	}
 }
 
+// TLSConfig specifies a *tls.Config
+func TLSConfig(t *tls.Config) Option {
+	return func(o *Options) {
+		// set the internal tls
+		o.TLSConfig = t
+
+		// set the default transport if one is not
+		// already set. Required for Init call below.
+		if o.Transport == nil {
+			o.Transport = transport.DefaultTransport
+		}
+
+		// set the transport tls
+		o.Transport.Init(
+			transport.Secure(true),
+			transport.TLSConfig(t),
+		)
+	}
+}
+
 // WithRouter sets the request router
 func WithRouter(r Router) Option {
 	return func(o *Options) {
@@ -185,12 +241,18 @@ func WithRouter(r Router) Option {
 }
 
 // Wait tells the server to wait for requests to finish before exiting
-func Wait(b bool) Option {
+// If `wg` is nil, server only wait for completion of rpc handler.
+// For user need finer grained control, pass a concrete `wg` here, server will
+// wait against it on stop.
+func Wait(wg *sync.WaitGroup) Option {
 	return func(o *Options) {
 		if o.Context == nil {
 			o.Context = context.Background()
 		}
-		o.Context = context.WithValue(o.Context, "wait", b)
+		if wg == nil {
+			wg = new(sync.WaitGroup)
+		}
+		o.Context = context.WithValue(o.Context, "wait", wg)
 	}
 }
 

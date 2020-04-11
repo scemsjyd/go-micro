@@ -4,23 +4,31 @@ import (
 	"context"
 	"time"
 
-	"github.com/micro/cli"
-	"github.com/micro/go-micro/broker"
-	"github.com/micro/go-micro/client"
-	"github.com/micro/go-micro/cmd"
-	"github.com/micro/go-micro/registry"
-	"github.com/micro/go-micro/selector"
-	"github.com/micro/go-micro/server"
-	"github.com/micro/go-micro/transport"
+	"github.com/micro/cli/v2"
+	"github.com/micro/go-micro/v2/auth"
+	"github.com/micro/go-micro/v2/broker"
+	"github.com/micro/go-micro/v2/client"
+	"github.com/micro/go-micro/v2/client/selector"
+	"github.com/micro/go-micro/v2/config"
+	"github.com/micro/go-micro/v2/config/cmd"
+	"github.com/micro/go-micro/v2/debug/profile"
+	"github.com/micro/go-micro/v2/debug/trace"
+	"github.com/micro/go-micro/v2/registry"
+	"github.com/micro/go-micro/v2/server"
+	"github.com/micro/go-micro/v2/transport"
 )
 
+// Options for micro service
 type Options struct {
+	Auth      auth.Auth
 	Broker    broker.Broker
 	Cmd       cmd.Cmd
+	Config    config.Config
 	Client    client.Client
 	Server    server.Server
 	Registry  registry.Registry
 	Transport transport.Transport
+	Profile   profile.Profile
 
 	// Before and After funcs
 	BeforeStart []func() error
@@ -31,17 +39,22 @@ type Options struct {
 	// Other options for implementations of the interface
 	// can be stored in a context
 	Context context.Context
+
+	Signal bool
 }
 
 func newOptions(opts ...Option) Options {
 	opt := Options{
+		Auth:      auth.DefaultAuth,
 		Broker:    broker.DefaultBroker,
 		Cmd:       cmd.DefaultCmd,
+		Config:    config.DefaultConfig,
 		Client:    client.DefaultClient,
 		Server:    server.DefaultServer,
 		Registry:  registry.DefaultRegistry,
 		Transport: transport.DefaultTransport,
 		Context:   context.Background(),
+		Signal:    true,
 	}
 
 	for _, o := range opts {
@@ -51,6 +64,7 @@ func newOptions(opts ...Option) Options {
 	return opt
 }
 
+// Broker to be used for service
 func Broker(b broker.Broker) Option {
 	return func(o *Options) {
 		o.Broker = b
@@ -66,6 +80,7 @@ func Cmd(c cmd.Cmd) Option {
 	}
 }
 
+// Client to be used for service
 func Client(c client.Client) Option {
 	return func(o *Options) {
 		o.Client = c
@@ -73,14 +88,30 @@ func Client(c client.Client) Option {
 }
 
 // Context specifies a context for the service.
-// Can be used to signal shutdown of the service.
-// Can be used for extra option values.
+// Can be used to signal shutdown of the service and for extra option values.
 func Context(ctx context.Context) Option {
 	return func(o *Options) {
 		o.Context = ctx
 	}
 }
 
+// HandleSignal toggles automatic installation of the signal handler that
+// traps TERM, INT, and QUIT.  Users of this feature to disable the signal
+// handler, should control liveness of the service through the context.
+func HandleSignal(b bool) Option {
+	return func(o *Options) {
+		o.Signal = b
+	}
+}
+
+// Profile to be used for debug profile
+func Profile(p profile.Profile) Option {
+	return func(o *Options) {
+		o.Profile = p
+	}
+}
+
+// Server to be used for service
 func Server(s server.Server) Option {
 	return func(o *Options) {
 		o.Server = s
@@ -95,10 +126,31 @@ func Registry(r registry.Registry) Option {
 		// Update Client and Server
 		o.Client.Init(client.Registry(r))
 		o.Server.Init(server.Registry(r))
-		// Update Selector
-		o.Client.Options().Selector.Init(selector.Registry(r))
 		// Update Broker
 		o.Broker.Init(broker.Registry(r))
+	}
+}
+
+// Tracer sets the tracer for the service
+func Tracer(t trace.Tracer) Option {
+	return func(o *Options) {
+		o.Server.Init(server.Tracer(t))
+	}
+}
+
+// Auth sets the auth for the service
+func Auth(a auth.Auth) Option {
+	return func(o *Options) {
+		o.Auth = a
+		o.Client.Init(client.Auth(a))
+		o.Server.Init(server.Auth(a))
+	}
+}
+
+// Config sets the config for the service
+func Config(c config.Config) Option {
+	return func(o *Options) {
+		o.Config = c
 	}
 }
 
@@ -150,13 +202,15 @@ func Metadata(md map[string]string) Option {
 	}
 }
 
+// Flags that can be passed to service
 func Flags(flags ...cli.Flag) Option {
 	return func(o *Options) {
 		o.Cmd.App().Flags = append(o.Cmd.App().Flags, flags...)
 	}
 }
 
-func Action(a func(*cli.Context)) Option {
+// Action can be used to parse user provided cli options
+func Action(a func(*cli.Context) error) Option {
 	return func(o *Options) {
 		o.Cmd.App().Action = a
 	}
@@ -225,24 +279,28 @@ func WrapSubscriber(w ...server.SubscriberWrapper) Option {
 
 // Before and Afters
 
+// BeforeStart run funcs before service starts
 func BeforeStart(fn func() error) Option {
 	return func(o *Options) {
 		o.BeforeStart = append(o.BeforeStart, fn)
 	}
 }
 
+// BeforeStop run funcs before service stops
 func BeforeStop(fn func() error) Option {
 	return func(o *Options) {
 		o.BeforeStop = append(o.BeforeStop, fn)
 	}
 }
 
+// AfterStart run funcs after service starts
 func AfterStart(fn func() error) Option {
 	return func(o *Options) {
 		o.AfterStart = append(o.AfterStart, fn)
 	}
 }
 
+// AfterStop run funcs after service stops
 func AfterStop(fn func() error) Option {
 	return func(o *Options) {
 		o.AfterStop = append(o.AfterStop, fn)
